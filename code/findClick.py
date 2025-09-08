@@ -8,7 +8,7 @@ from PyQt5.QtWidgets import (
     QApplication, QWidget, QLabel, QComboBox, QLineEdit, QPushButton,
     QVBoxLayout, QMessageBox, QDialog
 )
-from PyQt5.QtCore import Qt, QRect, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QRect, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QPainter, QColor, QFont
 
 # =================== OCR ===================
@@ -89,9 +89,10 @@ def click(pos):
 
 # =================== 识别线程 ===================
 class WorkerThread(QThread):
+    update_total_battle = pyqtSignal(int)
     finished = pyqtSignal()
     def __init__(self, window_region, x1, y1, rois, templates, a_word, b_word, c_word, run_word,
-                 confidence_threshold, heal_after_battles):
+                 confidence_threshold, heal_after_battles, total_battle_limit):
         super().__init__()
         self.window_region = window_region
         self.x1 = x1
@@ -104,10 +105,12 @@ class WorkerThread(QThread):
         self.run_word = run_word
         self.confidence_threshold = confidence_threshold
         self.heal_after_battles = heal_after_battles
+        self.total_battle_limit = total_battle_limit
         self.running = True
 
         # 战斗计数（满足条件的“战斗”次数）
         self.battle_count = 0
+        self.total_battle_count = 0
         # 记录最近确认点击时间戳，用于 10s 内 >=3 次判断
         self.confirm_clicks = deque()
 
@@ -181,6 +184,12 @@ class WorkerThread(QThread):
                     time.sleep(6)
                     continue
 
+                # 总战斗次数限制
+                if self.total_battle_limit > 0 and self.total_battle_count >= self.total_battle_limit:
+                    print(f"已达到总战斗次数 {self.total_battle_limit}，停止脚本。")
+                    self.running = False
+                    break
+
                 time.sleep(0.3)
         finally:
             cv2.destroyAllWindows()
@@ -196,8 +205,10 @@ class WorkerThread(QThread):
             self.confirm_clicks.popleft()
         if len(self.confirm_clicks) >= 3:
             self.battle_count += 1
+            self.total_battle_count += 1
             self.confirm_clicks.clear()
-            print(f"[战斗] 新增一次战斗计数，目前已 {self.battle_count} 次")
+            self.update_total_battle.emit(self.total_battle_count)
+            print(f"[战斗] 本次战斗 +1，总战斗次数 {self.total_battle_count}")
 
     def auto_heal(self):
         """
@@ -324,7 +335,7 @@ class AutoClicker(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("精灵自动识别脚本")
-        self.resize(640, 520)
+        self.resize(640, 640)
 
         layout = QVBoxLayout()
         font_combo = QFont("Arial", 12)
@@ -357,6 +368,17 @@ class AutoClicker(QWidget):
         self.heal_input = QLineEdit(); self.heal_input.setFont(font_input)
         self.heal_input.setText("0")
         layout.addWidget(self.heal_input)
+
+        # 总战斗次数限制
+        layout.addWidget(QLabel("总战斗次数限制（0 禁用，默认 255）:"))
+        self.total_battle_input = QLineEdit(); self.total_battle_input.setFont(font_input)
+        self.total_battle_input.setText("255")
+        layout.addWidget(self.total_battle_input)
+
+        # 显示累计战斗次数
+        self.total_label = QLabel("总战斗次数: 0")
+        self.total_label.setFont(QFont("Arial", 12))
+        layout.addWidget(self.total_label)
 
         # 操作按钮
         self.select_roi_btn = QPushButton("选择识别范围"); self.select_roi_btn.setFont(font_button)
@@ -471,6 +493,13 @@ class AutoClicker(QWidget):
         except:
             QMessageBox.warning(self, "错误", "请输入大于等于0的整数作为战斗次数阈值")
             return
+        try:
+            total_battle_limit = int(self.total_battle_input.text().strip())
+            if total_battle_limit < 0:
+                raise ValueError
+        except:
+            QMessageBox.warning(self, "错误", "请输入大于等于0的整数作为总战斗次数限制")
+            return
 
         window = self.windows_list[self.window_combo.currentIndex()]
         x1, y1, x2, y2 = window.left, window.top, window.right, window.bottom
@@ -490,10 +519,15 @@ class AutoClicker(QWidget):
             return
 
         # 启动线程
-        self.worker = WorkerThread(window_region, x1, y1, self.rois, templates, a_word, b_word, c_word, run_word, confidence, heal_after_battles)
+        self.worker = WorkerThread(window_region, x1, y1, self.rois, templates, a_word, b_word, c_word, run_word,
+                                   confidence, heal_after_battles, total_battle_limit)
+        self.worker.update_total_battle.connect(self.update_total_battle_label)
         self.worker.finished.connect(self.on_worker_finished)
         self.worker.start()
         QMessageBox.information(self, "已启动", "识别线程已启动。")
+
+    def update_total_battle_label(self, total):
+        self.total_label.setText(f"总战斗次数: {total}")
 
     def stop_script(self):
         if self.worker and self.worker.isRunning():
