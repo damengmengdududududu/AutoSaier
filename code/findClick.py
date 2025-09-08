@@ -2,6 +2,7 @@ import sys, os, time
 import cv2, numpy as np
 import pyautogui, pygetwindow as gw, mss
 from paddleocr import PaddleOCR
+from collections import deque
 
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QLabel, QComboBox, QLineEdit, QPushButton,
@@ -58,6 +59,21 @@ def load_templates(template_dir):
                 templates.append((filename, img))
     return templates
 
+def load_single_template(path):
+    if not os.path.exists(path):
+        return None
+    return cv2.imread(path, cv2.IMREAD_COLOR)
+
+def find_template(img, template, x1, y1, threshold=0.7):
+    if template is None:
+        return None
+    h, w = template.shape[:2]
+    res = cv2.matchTemplate(img, template, cv2.TM_CCOEFF_NORMED)
+    _, max_val, _, max_loc = cv2.minMaxLoc(res)
+    if max_val >= threshold:
+        return max_loc[0] + w // 2 + x1, max_loc[1] + h // 2 + y1
+    return None
+
 def find_monster(img, templates, x1, y1, confidence_threshold=0.6):
     for name, template in templates:
         h, w = template.shape[:2]
@@ -74,7 +90,8 @@ def click(pos):
 # =================== 识别线程 ===================
 class WorkerThread(QThread):
     finished = pyqtSignal()
-    def __init__(self, window_region, x1, y1, rois, templates, a_word, b_word, c_word, run_word, confidence_threshold):
+    def __init__(self, window_region, x1, y1, rois, templates, a_word, b_word, c_word, run_word,
+                 confidence_threshold, heal_after_battles):
         super().__init__()
         self.window_region = window_region
         self.x1 = x1
@@ -86,7 +103,18 @@ class WorkerThread(QThread):
         self.c_word = c_word
         self.run_word = run_word
         self.confidence_threshold = confidence_threshold
+        self.heal_after_battles = heal_after_battles
         self.running = True
+
+        # 战斗计数（满足条件的“战斗”次数）
+        self.battle_count = 0
+        # 记录最近确认点击时间戳，用于 10s 内 >=3 次判断
+        self.confirm_clicks = deque()
+
+        # 自动回复用模板
+        self.package_tpl = load_single_template(os.path.join("..", "photo", "package.png"))
+        self.heal_tpl = load_single_template(os.path.join("..", "photo", "heal.png"))
+        self.close_tpl = load_single_template(os.path.join("..", "photo", "close.png"))
 
     def run(self):
         print("开始实时识别...（按 Esc 关闭调试窗口）")
@@ -115,7 +143,20 @@ class WorkerThread(QThread):
                 pos_b = ocr_find_word_in_roi(screen_img, self.rois["确认按钮"], self.b_word, self.x1, self.y1)
                 if pos_b:
                     click(pos_b)
+                    self.track_battle()  # 记录确认点击时间（用于战斗判定）
                     time.sleep(1)
+                    # 如果是在自动治疗流程外，这次确认仍算在统计里
+                    # 直接 continue，优先确认点击
+                    continue
+
+                # 检查是否需要进入自动治疗流程（优先于技能/精灵识别）
+                if self.heal_after_battles > 0 and self.battle_count >= self.heal_after_battles:
+                    print("达到战斗次数阈值，开始执行自动回复逻辑...")
+                    self.auto_heal()
+                    # 回复后重置战斗计数与确认历史
+                    self.battle_count = 0
+                    self.confirm_clicks.clear()
+                    # 继续进入下一次循环（恢复正常识别）
                     continue
 
                 # 技能名称 / 对战精灵
@@ -133,7 +174,7 @@ class WorkerThread(QThread):
                     time.sleep(1)
                     continue
 
-                # 模板匹配
+                # 模板匹配怪物
                 pos_m = find_monster(screen_img, self.templates, self.x1, self.y1, self.confidence_threshold)
                 if pos_m:
                     click(pos_m)
@@ -145,12 +186,72 @@ class WorkerThread(QThread):
             cv2.destroyAllWindows()
             self.finished.emit()
 
+    def track_battle(self):
+        """在每次确认点击时调用，统计过去 10 秒内确认点击次数，
+        若 >=3 则计作一次战斗并清空记录（避免重复计数）。"""
+        now = time.time()
+        self.confirm_clicks.append(now)
+        # 删除超过 10 秒的点击记录
+        while self.confirm_clicks and now - self.confirm_clicks[0] > 10:
+            self.confirm_clicks.popleft()
+        if len(self.confirm_clicks) >= 3:
+            self.battle_count += 1
+            self.confirm_clicks.clear()
+            print(f"[战斗] 新增一次战斗计数，目前已 {self.battle_count} 次")
+
+    def auto_heal(self):
+        """
+        自动回复逻辑：
+        顺序寻找并点击 ../photo/package.png -> ../photo/heal.png -> ../photo/close.png
+        每次点击后 sleep 1 秒。期间优先识别并点击“确认”按钮以保证对话流程通畅。
+        自动回复过程中不进行技能/精灵/逃跑识别或模板匹配（只处理确认与回复模板）。
+        """
+        sequence = [
+            (self.package_tpl, "package.png"),
+            (self.heal_tpl, "heal.png"),
+            (self.close_tpl, "close.png")
+        ]
+        for tpl, name in sequence:
+            if tpl is None:
+                print(f"[自动回复] 模板缺失：{name}，跳过该步骤")
+                time.sleep(1)
+                continue
+
+            clicked = False
+            # 尝试一段时间去寻找对应模板并点击（总超时避免死循环）
+            start_time = time.time()
+            while time.time() - start_time < 10 and self.running:
+                screen_img = screenshot_window(self.window_region)
+
+                # 优先处理确认按钮：若出现就点掉，继续寻找模板
+                pos_confirm = ocr_find_word_in_roi(screen_img, self.rois["确认按钮"], self.b_word, self.x1, self.y1)
+                if pos_confirm:
+                    click(pos_confirm)
+                    time.sleep(0.5)
+                    # 也统计这次确认（但在自动回复场景我们并不把这些确认当作战斗统计的一部分）
+                    continue
+
+                # 寻找当前模板并点击
+                pos_tpl = find_template(screen_img, tpl, self.x1, self.y1, threshold=0.7)
+                if pos_tpl:
+                    click(pos_tpl)
+                    print(f"[自动回复] 点击 {name} -> {pos_tpl}")
+                    clicked = True
+                    break
+
+                time.sleep(0.3)
+
+            if not clicked:
+                print(f"[自动回复] 未能在超时内找到 {name}，继续下一步（若必要请检查模板）")
+            # 每步点击后等待 1 秒（题目要求）
+            time.sleep(1)
+
 # =================== ROI 选择对话框 ===================
 class MovableSelector(QDialog):
     def __init__(self, labels, x1, y1, width, height, parent=None):
         super().__init__(parent)
         self.setWindowTitle("框选区域（拖动/缩放，画满4个区域自动确认；Esc取消）")
-        # 置顶 + 可调整大小
+        # 置顶 + 模态对话框
         self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.Dialog)
         self.setWindowOpacity(0.3)
         # 放到游戏窗口之上，大小一致
@@ -250,6 +351,12 @@ class AutoClicker(QWidget):
         self.conf_input = QLineEdit(); self.conf_input.setFont(font_input)
         self.conf_input.setText("0.6")
         layout.addWidget(self.conf_input)
+
+        # 自动回复次数输入
+        layout.addWidget(QLabel("多少次战斗后回复（0 禁用）:"))
+        self.heal_input = QLineEdit(); self.heal_input.setFont(font_input)
+        self.heal_input.setText("0")
+        layout.addWidget(self.heal_input)
 
         # 操作按钮
         self.select_roi_btn = QPushButton("选择识别范围"); self.select_roi_btn.setFont(font_button)
@@ -356,6 +463,14 @@ class AutoClicker(QWidget):
         except:
             QMessageBox.warning(self, "错误", "请输入正确的置信度（如 0.6）")
             return
+        # heal_after_battles 必须为 >=0 的整数
+        try:
+            heal_after_battles = int(self.heal_input.text().strip())
+            if heal_after_battles < 0:
+                raise ValueError
+        except:
+            QMessageBox.warning(self, "错误", "请输入大于等于0的整数作为战斗次数阈值")
+            return
 
         window = self.windows_list[self.window_combo.currentIndex()]
         x1, y1, x2, y2 = window.left, window.top, window.right, window.bottom
@@ -364,7 +479,7 @@ class AutoClicker(QWidget):
         # dict.txt 选项
         template_info = self.monster_options[self.monster_combo.currentIndex()]
         template_dir = os.path.join("../photo", template_info["template"])
-        c_word = template_info["对战精灵"]
+        c_word = template_info["C"]
         a_word = self.skill_input.text().strip()
         b_word = "确认"
         run_word = "逃跑"
@@ -375,7 +490,7 @@ class AutoClicker(QWidget):
             return
 
         # 启动线程
-        self.worker = WorkerThread(window_region, x1, y1, self.rois, templates, a_word, b_word, c_word, run_word, confidence)
+        self.worker = WorkerThread(window_region, x1, y1, self.rois, templates, a_word, b_word, c_word, run_word, confidence, heal_after_battles)
         self.worker.finished.connect(self.on_worker_finished)
         self.worker.start()
         QMessageBox.information(self, "已启动", "识别线程已启动。")
